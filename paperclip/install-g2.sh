@@ -61,6 +61,30 @@ fi
 say "Creating user $PC_USER"
 id "$PC_USER" >/dev/null 2>&1 || useradd --system --create-home --shell /bin/bash "$PC_USER"
 
+say "Installing agent CLIs for $PC_USER (Claude Code first, Codex as fallback)"
+# User-local npm prefix so we never touch the global Node that OpenClaw uses.
+sudo -u "$PC_USER" -H bash -lc '
+  mkdir -p ~/.npm-global ~/.config
+  npm config set prefix ~/.npm-global
+  grep -q npm-global ~/.profile 2>/dev/null || echo "export PATH=\$HOME/.npm-global/bin:\$PATH" >> ~/.profile
+  export PATH=$HOME/.npm-global/bin:$PATH
+  npm install -g @anthropic-ai/claude-code @openai/codex
+  claude --version; codex --version
+'
+
+# Subscription auth, not API billing. Paperclip's claude_local adapter runs the
+# `claude` CLI; it bills your Claude subscription when CLAUDE_CODE_OAUTH_TOKEN is
+# set and ANTHROPIC_API_KEY is NOT set.
+ENV_FILE=/home/$PC_USER/.config/paperclip-agents.env
+if [ ! -f "$ENV_FILE" ]; then
+  cat >"$ENV_FILE" <<'EOF'
+# Filled in by you after install (see the steps printed at the end).
+# Claude subscription token from `claude setup-token`:
+CLAUDE_CODE_OAUTH_TOKEN=
+EOF
+fi
+chown "$PC_USER:$PC_USER" "$ENV_FILE"; chmod 600 "$ENV_FILE"
+
 say "Onboarding Paperclip as $PC_USER (interactive prompts may appear)"
 sudo -u "$PC_USER" -H bash -lc "cd ~ && npx --yes paperclipai onboard"
 
@@ -76,6 +100,11 @@ User=$PC_USER
 WorkingDirectory=/home/$PC_USER
 Environment=HOST=127.0.0.1
 Environment=PORT=$PORT
+Environment=PATH=/home/$PC_USER/.npm-global/bin:/usr/local/bin:/usr/bin:/bin
+# Subscription token for Claude Code; Codex uses ~/.codex/auth.json from `codex login`.
+EnvironmentFile=-/home/$PC_USER/.config/paperclip-agents.env
+# Never let an API key sneak in and switch Claude to pay-per-token billing.
+UnsetEnvironment=ANTHROPIC_API_KEY OPENAI_API_KEY
 ExecStart=/usr/bin/env npx --yes paperclipai run
 Restart=on-failure
 RestartSec=5
@@ -100,7 +129,23 @@ systemctl list-units --type=service --state=running --no-pager | grep -iE 'openc
 
 cat <<EOF
 
-Done. Open it from the Mac with an SSH tunnel:
+Done. Now connect your subscriptions (run these yourself; they ask you to log in):
+
+  1) Claude subscription (preferred):
+       sudo -u $PC_USER -i claude setup-token
+     Log in with your Claude account in the browser link it shows, then put the
+     token it prints into $ENV_FILE as CLAUDE_CODE_OAUTH_TOKEN=... and run:
+       systemctl restart paperclip
+     Check:  sudo -u $PC_USER -i bash -lc 'set -a; . $ENV_FILE; claude -p "say ok"'
+
+  2) Codex / ChatGPT subscription (fallback):
+       sudo -u $PC_USER -i codex login      # use --device-auth if no browser
+     Check:  sudo -u $PC_USER -i codex exec "say ok"
+
+  In Paperclip, give agents the "Claude Code" (claude_local) adapter; use the
+  "Codex" (codex_local) adapter for any agent you want on ChatGPT instead.
+
+Open it from the Mac with an SSH tunnel:
   ssh -i ~/.ssh/g2_vps_ed25519 -N -L $PORT:127.0.0.1:$PORT root@46.250.235.158
   then browse http://localhost:$PORT
 

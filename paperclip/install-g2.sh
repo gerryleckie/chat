@@ -124,6 +124,47 @@ systemctl --no-pager status paperclip | head -15
 ss -tlnp | grep ":$PORT " || echo "WARNING: nothing listening on $PORT yet; check: journalctl -u paperclip -n 50"
 curl -s -o /dev/null -w "HTTP %{http_code} from http://127.0.0.1:$PORT\n" "http://127.0.0.1:$PORT/" || true
 
+say "Cloudflare Tunnel (public HTTPS hostname, no open ports, no Mac needed)"
+# Uses a *dedicated* tunnel + unit so any existing cloudflared service is untouched.
+# Create the tunnel in Cloudflare Zero Trust -> Networks -> Tunnels -> Create
+# (type: Cloudflared), add a Public Hostname e.g. paperclip.<yourdomain> ->
+# http://127.0.0.1:$PORT, copy the token, then:
+#   echo 'TUNNEL_TOKEN=<token>' > /etc/paperclip-tunnel.env; chmod 600 /etc/paperclip-tunnel.env
+# and re-run this script with --install (it's idempotent).
+if ! command -v cloudflared >/dev/null; then
+  mkdir -p --mode=0755 /usr/share/keyrings
+  curl -fsSL https://pkg.cloudflare.com/cloudflare-main.gpg -o /usr/share/keyrings/cloudflare-main.gpg
+  echo "deb [signed-by=/usr/share/keyrings/cloudflare-main.gpg] https://pkg.cloudflare.com/cloudflared any main" \
+    > /etc/apt/sources.list.d/cloudflared.list
+  apt-get update -qq && apt-get install -y -qq cloudflared
+fi
+cloudflared --version
+cat >/etc/systemd/system/paperclip-tunnel.service <<EOF
+[Unit]
+Description=Cloudflare Tunnel for Paperclip
+After=network-online.target paperclip.service
+Wants=network-online.target
+
+[Service]
+EnvironmentFile=/etc/paperclip-tunnel.env
+ExecStart=/usr/bin/cloudflared --no-autoupdate tunnel run --token \${TUNNEL_TOKEN}
+Restart=on-failure
+RestartSec=5
+DynamicUser=yes
+MemoryMax=256M
+
+[Install]
+WantedBy=multi-user.target
+EOF
+systemctl daemon-reload
+if [ -s /etc/paperclip-tunnel.env ] && grep -q '^TUNNEL_TOKEN=.\+' /etc/paperclip-tunnel.env; then
+  systemctl enable --now paperclip-tunnel
+  sleep 5; systemctl --no-pager status paperclip-tunnel | head -8
+  echo "IMPORTANT: put a Cloudflare Access policy (your email only) on that hostname."
+else
+  echo "No tunnel token yet (/etc/paperclip-tunnel.env). Tunnel unit installed but not started."
+fi
+
 say "Glasses services after install"
 systemctl list-units --type=service --state=running --no-pager | grep -iE 'openclaw|ocuclaw|g2|tailscale' || true
 
@@ -145,11 +186,13 @@ Done. Now connect your subscriptions (run these yourself; they ask you to log in
   In Paperclip, give agents the "Claude Code" (claude_local) adapter; use the
   "Codex" (codex_local) adapter for any agent you want on ChatGPT instead.
 
-Open it from the Mac with an SSH tunnel:
+Open it at your Cloudflare hostname (behind Cloudflare Access), or as a backup
+from the Mac with an SSH tunnel:
   ssh -i ~/.ssh/g2_vps_ed25519 -N -L $PORT:127.0.0.1:$PORT root@46.250.235.158
   then browse http://localhost:$PORT
 
 Undo completely:
-  systemctl disable --now paperclip; rm /etc/systemd/system/paperclip.service
+  systemctl disable --now paperclip paperclip-tunnel
+  rm /etc/systemd/system/paperclip.service /etc/systemd/system/paperclip-tunnel.service /etc/paperclip-tunnel.env
   userdel -r $PC_USER
 EOF
